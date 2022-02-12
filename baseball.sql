@@ -83,7 +83,7 @@ select trunc(1988, -1);
 with steals as (
     select sum(sb) as successes,
            (sum(sb) + sum(cs)) as attempts,
-           round((sum(sb) / (sum(sb) + sum(cs))::numeric), 2) as percentage,
+           round((sum(sb) / (sum(sb) + sum(cs))::numeric), 3) * 100 as percentage,
            playerid
     from batting
     where sb > 0
@@ -100,7 +100,8 @@ with steals as (
 select *
 from steals
 inner join stealing_players using (playerid)
-order by playerid
+where attempts > 20
+order by percentage desc
 
 -- 5. From 1970 to 2016, what is the largest number of wins for a team that did not win the world series?
 -- What is the smallest number of wins for a team that did win the world series?
@@ -137,10 +138,159 @@ group by yearid
 order by yearid
 
 
+-- CORRECT ANSWER:
+
+WITH max_wins AS (
+	SELECT
+		yearid,
+		MAX(w) AS max_wins
+	FROM teams
+	WHERE yearid >= 1970
+	GROUP BY yearid
+	ORDER BY yearid
+),
+team_with_most_wins AS (
+	SELECT m.yearid, max_wins, name, wswin
+	FROM max_wins m
+	INNER JOIN teams t
+	ON max_wins = w AND m.yearid = t.yearid
+)
+SELECT
+ROUND(
+(SELECT COUNT(*)
+FROM team_with_most_wins
+WHERE wswin = 'Y') * 100.0 / (SELECT COUNT(*) FROM team_with_most_wins), 2) AS ws_win_pct;
+
+
 -- 6. Which managers have won the TSN Manager of the Year award in both the National League (NL) and the American League (AL)? Give their full name and the teams that they were managing when they won the award.
 --
--- 7. Which pitcher was the least efficient in 2016 in terms of salary / strikeouts? Only consider pitchers who started at least 10 games (across all teams). Note that pitchers often play for more than one team in a season, so be sure that you are counting all stats for each player.
+
+select playerid, case when dense_rank() over(partition by playerid order by lgid) + dense_rank() over(partition by playerid order by lgid desc) - 1 = 2 then true else false end as won_in_both_leagues  from awardsmanagers where awardid = 'TSN Manager of the Year' and playerid = 'larusto01'
+
+select playerid, lgid, dense_rank() over(partition by playerid order by lgid) + dense_rank() over(partition by playerid order by lgid desc) - 1 as won_in_both_leagues  from awardsmanagers where awardid = 'TSN Manager of the Year' and playerid = 'larusto01'
+
+select playerid, awardid, lgid from awardsmanagers where playerid = 'larusto01'
+
+with winners as (
+    select playerid,
+           yearid,
+           lgid,
+           -- hack for counting distinct values in a window function
+           -- https://www.sqlservercentral.com/forums/topic/how-to-distinct-count-with-windows-functions-i-e-over-and-partition-by
+           -- the first dense_rank assigns a 1 to the first unique lgids then a 2 to the next unique lgid
+           -- the second dense_rank reverses the order, assigning a 2 to the first unique lgid then a 2 to the next unique lgids
+           -- subtracting 1 then makes all values equal across rows (in this case 2 since we're only dealing with two leagues)
+           case when dense_rank() over(partition by playerid order by lgid) + dense_rank() over(partition by playerid order by lgid desc) - 1 = 2
+               then true
+               else false
+               end as won_in_both_leagues
+    from awardsmanagers
+    where awardid = 'TSN Manager of the Year'
+    and lgid in ('NL', 'AL')
+),
+ managed_teams as (
+    select distinct m.playerid,
+                    t2.franchname,
+                    m.teamid,
+                    m.yearid,
+                    t.lgid,
+                    tsn.won_in_both_leagues
+    from managers m
+    inner join winners tsn
+    on tsn.playerid = m.playerid
+    and tsn.yearid = m.yearid
+    inner join teams t
+    on t.teamid = m.teamid
+    inner join teamsfranchises t2
+    on t.franchid = t2.franchid
+ )
+select mt.playerid,
+       concat(p.namefirst, ' ', p.namelast) as full_name,
+       mt.franchname team_name,
+       mt.yearid as year,
+       case when mt.lgid = 'AL' then 'American' else 'National' end as league
+from managed_teams as mt
+inner join people as p
+on p.playerid = mt.playerid
+where mt.won_in_both_leagues = true
+order by playerid desc;
+
+
+-- Michael's solution:
+
+WITH winning_managers AS (
+	SELECT playerid
+	FROM awardsmanagers
+	WHERE awardid = 'TSN Manager of the Year'
+	AND lgid IN ('AL', 'NL')
+	GROUP BY playerid
+	HAVING COUNT(DISTINCT lgid) = 2)
+SELECT
+	namefirst || ' ' || namelast AS manager_name,
+	yearid,
+	name
+FROM awardsmanagers
+INNER JOIN people
+USING(playerid)
+INNER JOIN managers
+USING (playerid, yearid)
+INNER JOIN teams
+USING (teamid, yearid)
+WHERE awardid = 'TSN Manager of the Year'
+AND playerid IN (SELECT * FROM winning_managers)
+ORDER BY manager_name, yearid;
+
+-- 7. Which pitcher was the least efficient in 2016 in terms of salary / strikeouts?
+-- Only consider pitchers who started at least 10 games (across all teams).
+-- Note that pitchers often play for more than one team in a season, so be sure that you are counting all stats for each player.
 --
+with pitcher_efficiency_2016 as (
+    select (salary / so)::numeric::money as price_per_so,
+           p.playerid
+    from pitching as p
+    inner join salaries as s
+    on s.playerid = p.playerid
+    and s.yearid = p.yearid
+    and s.teamid = p.teamid
+    where gs >= 10
+    and p.yearid = 2016
+)
+select price_per_so, concat(p.namefirst, ' ', p.namelast) from pitcher_efficiency_2016
+inner join people p
+using (playerid)
+order by price_per_so desc
+limit 1
+
+
+--- Michael's solution:
+
+WITH full_pitching AS (
+	SELECT
+		playerid,
+		SUM(so) AS so,
+		SUM(g) AS g,
+		SUM(gs) AS gs
+	FROM pitching
+	WHERE yearid = 2016
+	GROUP BY playerid
+),
+full_salary AS (
+	SELECT playerid, SUM(salary) AS salary
+	FROM salaries
+	WHERE yearid = 2016
+	GROUP BY playerid
+)
+SELECT
+	namefirst || ' ' || namelast AS fullname,
+	salary / so AS dollars_per_so
+FROM full_pitching
+INNER JOIN full_salary
+USING(playerid)
+INNER JOIN people
+USING(playerid)
+WHERE g >= 10
+ORDER BY dollars_per_so DESC;
+
 -- 8. Find all players who have had at least 3000 career hits. Report those players' names, total number of hits, and the year they were inducted into the hall of fame (If they were not inducted into the hall of fame, put a null in that column.) Note that a player being inducted into the hall of fame is indicated by a 'Y' in the **inducted** column of the halloffame table.
 --
 -- 9. Find all players who had at least 1,000 hits for two different teams. Report those players' full names.
